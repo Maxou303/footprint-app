@@ -1,237 +1,218 @@
-import json
-import time
-import threading
-import logging
-import uuid
-import signal
-import sys
-from datetime import datetime
-
 import pandas as pd
 import numpy as np
-import requests
-
 import dash
 import dash_bootstrap_components as dbc
-from dash import dcc, html
-from dash.dependencies import Input, Output, State
-from dash.exceptions import PreventUpdate
-import plotly.graph_objs as go
+from dash import html, dcc, Input, Output, State
+import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
-from websocket import WebSocketApp  # Assurez-vous d'avoir installé websocket-client
+import threading
+import requests
+import json
+import time
+import logging
+import signal
+import sys
+from websocket import WebSocketApp
+import uuid
 
 # ============================================================
-#                      CONFIGURATION
+#                       Configuration
 # ============================================================
 
-BINANCE_FSTREAM_URL = "wss://fstream.binance.com"
+# Configuration de base
+DEFAULT_SYMBOL = "BTCUSDT"
+BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
 BINANCE_API_URL = "https://api.binance.com"
-DEFAULT_SYMBOL = "BTCUSDT"         # Symbole par défaut
+HISTORICAL_LIMIT = 1000  # Nombre de trades historiques à récupérer
+REFRESH_INTERVAL_MS = 1000  # Intervalle de rafraîchissement en millisecondes
+INITIAL_DATA_RETENTION_MS = 2 * 3600 * 1000  # 2 heures en millisecondes
+MAX_DATA_RETENTION_MS = 24 * 3600 * 1000  # 24 heures en millisecondes
 
-REFRESH_INTERVAL_MS = 4000          # Intervalle de rafraîchissement en millisecondes
-HISTORICAL_TIMEFRAME = 60            # Temps en secondes pour le backfill historique
-HISTORICAL_LIMIT = 1000              # Nombre de bougies historiques à récupérer
+# Configuration du journal
+logging.basicConfig(
+    level=logging.INFO,  # Niveau de journalisation à INFO
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger()
 
-# Structures de données pour stocker les trades et l'orderbook
-trades_dict = pd.DataFrame(columns=["ts", "price", "qty", "is_buyer_maker"])
-trades_buffer = []  # Buffer pour accumuler les trades avant de les ajouter au DataFrame
-
-orderbook_dict = {}
-orderbook_lock = threading.Lock()  # Verrou pour protéger l'orderbook lors des mises à jour
-trades_lock = threading.Lock()     # Verrou pour protéger trades_dict et trades_buffer
-
-# Événements pour gérer la fermeture des threads
+# Événement d'arrêt pour une fermeture propre
 shutdown_event = threading.Event()
 
-# Configuration du logging
-logging.basicConfig(
-    level=logging.INFO,  # Passer à DEBUG pour plus de détails
-    format='[%(asctime)s] %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+# Lock pour protéger l'accès aux données de trades
+trades_lock = threading.Lock()
+
+# DataFrame principal pour stocker les trades
+trades_dict = pd.DataFrame(columns=["ts", "price", "qty", "is_buyer_maker"])
 
 # ============================================================
-#           1) WEBSOCKET TRADES & DEPTH (avec Optimisations)
+#                       WebSocketManager
 # ============================================================
 
-def aggtrade_endpoint(symbol: str) -> str:
-    """Retourne l'URL du WebSocket pour les trades agrégés d'un symbole."""
-    return f"{BINANCE_FSTREAM_URL}/ws/{symbol.lower()}@aggTrade"
+class WebSocketManager:
+    """Gestionnaire des WebSockets pour les données de trades et de profondeur de marché."""
 
-def depth_endpoint(symbol: str) -> str:
-    """Retourne l'URL du WebSocket pour la profondeur de marché d'un symbole."""
-    return f"{BINANCE_FSTREAM_URL}/ws/{symbol.lower()}@depth20@100ms"
+    def __init__(self, symbol: str):
+        self.symbol = symbol.upper()
+        self.trade_ws = None
+        self.depth_ws = None
+        self.ws_thread_lock = threading.Lock()
+        self.trade_url = f"{BINANCE_WS_URL}/{self.symbol.lower()}@aggTrade"
+        self.depth_url = f"{BINANCE_WS_URL}/{self.symbol.lower()}@depth"
 
-def on_trade_message(ws, message):
-    """Gestionnaire d'événements pour les messages de trades."""
-    try:
-        data = json.loads(message)
-        trade = {
-            "ts": data["T"],
-            "price": float(data["p"]),
-            "qty": float(data["q"]),
-            "is_buyer_maker": bool(data["m"])  # Force le booléen
-        }
-        with trades_lock:
-            trades_buffer.append(trade)
-        logger.debug(f"Received trade: {trade}")
-    except Exception as e:
-        logger.error(f"Error processing trade message: {e}")
-
-def on_depth_message(ws, message):
-    """Gestionnaire d'événements pour les messages de profondeur de marché."""
-    try:
-        data = json.loads(message)
-        bids = data.get("b", [])
-        asks = data.get("a", [])
-        with orderbook_lock:
-            df_bids = pd.DataFrame(bids, columns=["price", "qty"], dtype=float)
-            df_asks = pd.DataFrame(asks, columns=["price", "qty"], dtype=float)
-            # Les bids doivent être triés en DESC et les asks en ASC
-            orderbook_dict["bids"] = df_bids.sort_values("price", ascending=False)
-            orderbook_dict["asks"] = df_asks.sort_values("price", ascending=True)
-        logger.debug(f"Updated orderbook")
-    except Exception as e:
-        logger.error(f"Error processing depth message: {e}")
-
-def on_trade_error(ws, error):
-    """Gestionnaire d'erreurs pour le WebSocket des trades."""
-    logger.error(f"### TRADE WS ERROR ### {error}")
-    ws.close()
-
-def on_trade_close(ws, close_status_code, close_msg):
-    """Gestionnaire de fermeture pour le WebSocket des trades."""
-    if close_status_code or close_msg:
-        logger.warning(f"### TRADE WS CLOSED ### {close_status_code} - {close_msg}")
-    else:
-        logger.info("### TRADE WS CLOSED ###")
-    # Reconnexion avec backoff exponentiel si l'événement de fermeture n'est pas dû à un arrêt
-    if not shutdown_event.is_set():
-        reconnect_with_backoff(run_trade_ws)
-
-def on_depth_error(ws, error):
-    """Gestionnaire d'erreurs pour le WebSocket de profondeur."""
-    logger.error(f"### DEPTH WS ERROR ### {error}")
-    ws.close()
-
-def on_depth_close(ws, close_status_code, close_msg):
-    """Gestionnaire de fermeture pour le WebSocket de profondeur."""
-    if close_status_code or close_msg:
-        logger.warning(f"### DEPTH WS CLOSED ### {close_status_code} - {close_msg}")
-    else:
-        logger.info("### DEPTH WS CLOSED ###")
-    # Reconnexion avec backoff exponentiel si l'événement de fermeture n'est pas dû à un arrêt
-    if not shutdown_event.is_set():
-        reconnect_with_backoff(run_depth_ws)
-
-def reconnect_with_backoff(target_func, max_attempts=5, base_delay=1):
-    """Reconnexion avec une stratégie de backoff exponentiel."""
-    delay = base_delay
-    attempts = 0
-    while attempts < max_attempts and not shutdown_event.is_set():
+    def on_trade_message(self, ws, message):
+        """Traitement des messages de trades."""
         try:
-            logger.info(f"Reconnecting to WebSocket in {delay} seconds...")
-            time.sleep(delay)
-            target_func()
-            logger.info(f"Reconnected to WebSocket.")
-            return
+            trade = json.loads(message)
+            new_trade = {
+                "ts": trade["T"],
+                "price": float(trade["p"]),
+                "qty": float(trade["q"]),
+                "is_buyer_maker": bool(trade["m"])
+            }
+            with trades_lock:
+                trades_buffer.append(new_trade)
+            logger.debug(f"Received trade: {new_trade}")
         except Exception as e:
-            logger.error(f"Reconnection attempt {attempts + 1} failed: {e}")
-            delay *= 2  # Exponentiel
-            attempts += 1
-    if attempts >= max_attempts:
-        logger.error(f"Failed to reconnect to WebSocket after {max_attempts} attempts.")
+            logger.error(f"Error processing trade message: {e}")
 
-def run_trade_ws():
-    """Lance le WebSocket pour les trades du symbole par défaut."""
-    url = aggtrade_endpoint(DEFAULT_SYMBOL)
-    logger.info(f"[TRADES] Connecting WS for {DEFAULT_SYMBOL}: {url}")
-    ws_app = WebSocketApp(
-        url,
-        on_message=on_trade_message,
-        on_error=on_trade_error,
-        on_close=on_trade_close
-    )
-    ws_app.run_forever()
+    def on_depth_message(self, ws, message):
+        """Traitement des messages de profondeur de marché."""
+        try:
+            depth = json.loads(message)
+            # Traitement éventuel des données de profondeur
+            logger.debug("Received depth update.")
+        except Exception as e:
+            logger.error(f"Error processing depth message: {e}")
 
-def run_depth_ws():
-    """Lance le WebSocket pour la profondeur de marché du symbole par défaut."""
-    url = depth_endpoint(DEFAULT_SYMBOL)
-    logger.info(f"[DEPTH] Connecting WS for {DEFAULT_SYMBOL}: {url}")
-    ws_app = WebSocketApp(
-        url,
-        on_message=on_depth_message,
-        on_error=on_depth_error,
-        on_close=on_depth_close
-    )
-    ws_app.run_forever()
+    def on_error(self, ws, error, ws_type="WS"):
+        """Gestionnaire d'erreurs pour les WebSockets."""
+        logger.error(f"### {ws_type} ERROR ### {error}")
+        ws.close()
 
-current_trade_ws_thread = None
-current_depth_ws_thread = None
-ws_thread_lock = threading.Lock()
+    def on_close(self, ws, close_status_code, close_msg, ws_type="WS"):
+        """Gestionnaire de fermeture pour les WebSockets."""
+        if close_status_code or close_msg:
+            logger.warning(f"### {ws_type} CLOSED ### {close_status_code} - {close_msg}")
+        else:
+            logger.info(f"### {ws_type} CLOSED ###")
+        # Reconnexion avec backoff exponentiel si l'événement de fermeture n'est pas dû à un arrêt
+        if not shutdown_event.is_set():
+            self.reconnect_with_backoff(ws_type)
 
-def start_trade_ws_thread():
-    """Démarre un thread pour le WebSocket des trades du symbole par défaut."""
-    global current_trade_ws_thread
-    with ws_thread_lock:
-        if current_trade_ws_thread and current_trade_ws_thread.is_alive():
-            logger.info(f"[TRADES] WS thread for {DEFAULT_SYMBOL} already running.")
-            return
-        t = threading.Thread(target=run_trade_ws, daemon=True)
-        t.start()
-        current_trade_ws_thread = t
-        logger.info(f"[TRADES] WS thread for {DEFAULT_SYMBOL} started.")
+    def reconnect_with_backoff(self, ws_type, max_attempts=5, base_delay=1):
+        """Reconnexion avec une stratégie de backoff exponentiel."""
+        delay = base_delay
+        attempts = 0
+        while attempts < max_attempts and not shutdown_event.is_set():
+            try:
+                logger.info(f"Reconnecting {ws_type} in {delay} seconds...")
+                time.sleep(delay)
+                if ws_type == "TRADES":
+                    self.start_trade_ws()
+                elif ws_type == "DEPTH":
+                    self.start_depth_ws()
+                logger.info(f"Reconnected {ws_type}.")
+                return
+            except Exception as e:
+                logger.error(f"Reconnection attempt {attempts + 1} for {ws_type} failed: {e}")
+                delay *= 2  # Exponentiel
+                attempts += 1
+        if attempts >= max_attempts:
+            logger.error(f"Failed to reconnect {ws_type} after {max_attempts} attempts.")
 
-def start_depth_ws_thread():
-    """Démarre un thread pour le WebSocket de profondeur de marché du symbole par défaut."""
-    global current_depth_ws_thread
-    with ws_thread_lock:
-        if current_depth_ws_thread and current_depth_ws_thread.is_alive():
-            logger.info(f"[DEPTH] WS thread for {DEFAULT_SYMBOL} already running.")
-            return
-        t = threading.Thread(target=run_depth_ws, daemon=True)
-        t.start()
-        current_depth_ws_thread = t
-        logger.info(f"[DEPTH] WS thread for {DEFAULT_SYMBOL} started.")
+    def run_trade_ws(self):
+        """Lance le WebSocket pour les trades du symbole."""
+        logger.info(f"[TRADES] Connecting WS for {self.symbol}: {self.trade_url}")
+        self.trade_ws = WebSocketApp(
+            self.trade_url,
+            on_message=self.on_trade_message,
+            on_error=lambda ws, err: self.on_error(ws, err, "TRADES"),
+            on_close=lambda ws, code, msg: self.on_close(ws, code, msg, "TRADES")
+        )
+        self.trade_ws.run_forever()
 
-def stop_websockets():
-    """Arrête proprement les WebSockets en signalant l'événement de shutdown."""
-    logger.info("Shutting down WebSockets...")
-    shutdown_event.set()
-    # Les WebSocketApp ne peuvent pas être fermés directement depuis d'autres threads,
-    # donc nous devons laisser les callbacks gérer la fermeture en vérifiant shutdown_event
-    if current_trade_ws_thread:
-        current_trade_ws_thread.join(timeout=5)
-    if current_depth_ws_thread:
-        current_depth_ws_thread.join(timeout=5)
-    logger.info("WebSockets shut down.")
+    def run_depth_ws(self):
+        """Lance le WebSocket pour la profondeur de marché du symbole."""
+        logger.info(f"[DEPTH] Connecting WS for {self.symbol}: {self.depth_url}")
+        self.depth_ws = WebSocketApp(
+            self.depth_url,
+            on_message=self.on_depth_message,
+            on_error=lambda ws, err: self.on_error(ws, err, "DEPTH"),
+            on_close=lambda ws, code, msg: self.on_close(ws, code, msg, "DEPTH")
+        )
+        self.depth_ws.run_forever()
+
+    def start_trade_ws(self):
+        """Démarre un thread pour le WebSocket des trades."""
+        with self.ws_thread_lock:
+            if self.trade_ws and self.trade_ws.keep_running:
+                logger.info(f"[TRADES] WS thread for {self.symbol} already running.")
+                return
+            thread = threading.Thread(target=self.run_trade_ws, daemon=True)
+            thread.start()
+            logger.info(f"[TRADES] WS thread for {self.symbol} started.")
+
+    def start_depth_ws(self):
+        """Démarre un thread pour le WebSocket de profondeur de marché."""
+        with self.ws_thread_lock:
+            if self.depth_ws and self.depth_ws.keep_running:
+                logger.info(f"[DEPTH] WS thread for {self.symbol} already running.")
+                return
+            thread = threading.Thread(target=self.run_depth_ws, daemon=True)
+            thread.start()
+            logger.info(f"[DEPTH] WS thread for {self.symbol} started.")
+
+    def stop_websockets(self):
+        """Arrête proprement les WebSockets."""
+        logger.info("Shutting down WebSockets...")
+        shutdown_event.set()
+        if self.trade_ws:
+            self.trade_ws.close()
+        if self.depth_ws:
+            self.depth_ws.close()
+        logger.info("WebSockets shut down.")
+
+# ============================================================
+#           Données et Traitement
+# ============================================================
 
 def process_trades_buffer():
     """
     Ajoute les trades du buffer au DataFrame principal et purge les anciens trades.
-    Limite les données à 2 heures pour optimiser les performances.
+    Limite les données à 24 heures pour optimiser les performances.
     """
     with trades_lock:
         if trades_buffer:
             df_new = pd.DataFrame(trades_buffer)
-            # Vérifier si df_new n'est pas vide et ne contient pas uniquement des NA
-            if not df_new.empty and not df_new.isna().all().all():
+            # Supprimer les colonnes entièrement NA avant la concaténation
+            df_new = df_new.dropna(axis=1, how='all')
+            if not df_new.empty:
                 global trades_dict
                 trades_dict = pd.concat([trades_dict, df_new], ignore_index=True)
                 trades_buffer.clear()
-                # Limiter à 2 heures de données
-                cutoff = int(time.time() * 1000) - (2 * 3600 * 1000)
+                # Limiter à 24 heures de données
+                cutoff = int(time.time() * 1000) - MAX_DATA_RETENTION_MS
                 trades_dict = trades_dict[trades_dict["ts"] > cutoff]
                 logger.debug(f"Processed trades buffer. Total trades: {len(trades_dict)}")
             else:
                 trades_buffer.clear()
-                logger.warning("Trades buffer is empty or contains all-NA data. Skipping concatenation.")
+                logger.warning("Trades buffer is empty after dropping all-NA columns. Skipping concatenation.")
 
-# ============================================================
-#   2) Fonctions d'agrégation : OHLC, Footprint, etc.
-# ============================================================
+def periodic_trade_processor():
+    """
+    Processus en arrière-plan pour traiter les buffers de trades et les ajouter au DataFrame principal.
+    """
+    logger.info("Started trade processor thread.")
+    while not shutdown_event.is_set():
+        process_trades_buffer()
+        time.sleep(1)  # Traiter les buffers toutes les secondes
+    logger.info("Stopped trade processor thread.")
+
+# Liste tampon pour stocker les trades en attente de traitement
+trades_buffer = []
 
 def build_ohlc_df(symbol: str, timeframe_seconds: int, only_big_trades: bool=False, min_volume_filter: float=0.0) -> pd.DataFrame:
     """
@@ -259,8 +240,8 @@ def build_ohlc_df(symbol: str, timeframe_seconds: int, only_big_trades: bool=Fal
         columns={"first": "open", "max": "high", "min": "low", "last": "close"}
     )
     ohlc["volume"] = grouped["qty"].sum()
-    ohlc["longs"] = grouped["is_buyer_maker"].apply(lambda x: (x == False).sum())
-    ohlc["shorts"] = grouped["is_buyer_maker"].apply(lambda x: (x == True).sum())
+    ohlc["longs"] = grouped["is_buyer_maker"].apply(lambda x: (~x).sum())
+    ohlc["shorts"] = grouped["is_buyer_maker"].apply(lambda x: x.sum())
     ohlc.reset_index(inplace=True)
     ohlc.sort_values("time_block", ascending=True, inplace=True)
 
@@ -271,7 +252,7 @@ def build_ohlc_df(symbol: str, timeframe_seconds: int, only_big_trades: bool=Fal
 def build_footprint_df(symbol: str, timeframe_seconds: int, price_bin_size: float,
                        cluster_type: str="buy_vol", only_big_trades: bool=False, min_volume_filter: float=0.0) -> pd.DataFrame:
     """
-    Construit un DataFrame pour le Footprint Orderflow.
+    Construit un DataFrame pour le Footprint Orderflow en inférant la direction des trades.
     """
     with trades_lock:
         df = trades_dict.copy()
@@ -287,12 +268,30 @@ def build_footprint_df(symbol: str, timeframe_seconds: int, price_bin_size: floa
         logger.debug(f"Footprint DataFrame for {symbol} after filtering is empty.")
         return pd.DataFrame(), 'RdBu', ""
 
+    # Assurer l'ordre chronologique
+    df = df.sort_values("ts")
+
+    # Inférer la direction du trade en comparant avec le trade précédent
+    df["prev_price"] = df["price"].shift(1)
+    df["trade_direction"] = np.where(df["price"] > df["prev_price"], "buy",
+                                     np.where(df["price"] < df["prev_price"], "sell", "neutral"))
+
+    # Remplacer les "neutral" par l'utilisation de `is_buyer_maker`
+    df["trade_direction"] = np.where(df["trade_direction"] == "neutral",
+                                     np.where(df["is_buyer_maker"], "sell", "buy"),
+                                     df["trade_direction"])
+
     df["time_block"] = (df["ts"] // 1000) - ((df["ts"] // 1000) % timeframe_seconds)
     df["price_bin"] = (df["price"] // price_bin_size) * price_bin_size
 
-    # Séparer les buy_vol et sell_vol
-    df["buy_vol"] = np.where(~df["is_buyer_maker"], df["qty"], 0.0)
-    df["sell_vol"] = np.where(df["is_buyer_maker"], df["qty"], 0.0)
+    # Attribution basée sur la direction du trade
+    df["buy_vol"] = np.where(df["trade_direction"] == "buy", df["qty"], 0.0)
+    df["sell_vol"] = np.where(df["trade_direction"] == "sell", df["qty"], 0.0)
+
+    # Logs pour vérifier l'attribution
+    total_buy_vol = df["buy_vol"].sum()
+    total_sell_vol = df["sell_vol"].sum()
+    logger.debug(f"Total Buy Volume (inferred): {total_buy_vol}, Total Sell Volume (inferred): {total_sell_vol}")
 
     grouped = df.groupby(["time_block", "price_bin"]).agg({
         "buy_vol": "sum",
@@ -301,28 +300,32 @@ def build_footprint_df(symbol: str, timeframe_seconds: int, price_bin_size: floa
     }).reset_index()
     grouped.rename(columns={"qty": "count_trades"}, inplace=True)
 
+    # Logs pour vérifier l'agrégation
     logger.debug(f"Aggregated Footprint DataFrame:\n{grouped.head()}")
 
-    # Calculer les valeurs selon le type de cluster
-    if cluster_type == "buy_vol":
-        grouped["value"] = grouped["buy_vol"]
-        colorscale = 'Blues'
-        colorbar_title = "Buy Volume"
-    elif cluster_type == "sell_vol":
-        grouped["value"] = grouped["sell_vol"]
-        colorscale = 'Reds'
-        colorbar_title = "Sell Volume"
-    elif cluster_type == "count_trades":
-        grouped["value"] = grouped["count_trades"]
-        colorscale = 'Viridis'
-        colorbar_title = "Count Trades"
-    elif cluster_type == "net_vol":
-        grouped["value"] = grouped["buy_vol"] - grouped["sell_vol"]
-        colorscale = 'RdBu'
-        colorbar_title = "Net Volume"
+    # Calcul des valeurs selon le type de cluster
+    if cluster_type != "delta_vol":
+        if cluster_type == "buy_vol":
+            grouped["value"] = grouped["buy_vol"]
+            colorscale = 'Blues'
+            colorbar_title = "Buy Volume"
+        elif cluster_type == "sell_vol":
+            grouped["value"] = grouped["sell_vol"]
+            colorscale = 'Reds'
+            colorbar_title = "Sell Volume"
+        elif cluster_type == "count_trades":
+            grouped["value"] = grouped["count_trades"]
+            colorscale = 'Viridis'
+            colorbar_title = "Count Trades"
+        else:
+            logger.error(f"Unknown cluster_type: {cluster_type}")
+            raise ValueError(f"Unknown cluster_type: {cluster_type}")
     else:
-        logger.error(f"Unknown cluster_type: {cluster_type}")
-        raise ValueError(f"Unknown cluster_type: {cluster_type}")
+        # Pour 'delta_vol', calculer la différence entre buy_vol et sell_vol
+        grouped["delta_vol"] = grouped["buy_vol"] - grouped["sell_vol"]
+        grouped["value"] = grouped["delta_vol"]
+        colorscale = 'RdBu'
+        colorbar_title = "Delta Volume"
 
     grouped["datetime"] = pd.to_datetime(grouped["time_block"], unit='s', utc=True)
     logger.debug(f"Built Footprint DataFrame for {symbol}: {grouped.head()}")
@@ -401,7 +404,7 @@ def calculate_poc_val_vah(vp_df: pd.DataFrame) -> pd.DataFrame:
     return poc_val_vah_df
 
 # ============================================================
-#   2.1) Ajout du Backfill Historique
+#   Backfill Historique
 # ============================================================
 
 def fetch_historical_trades(symbol: str, limit: int=HISTORICAL_LIMIT) -> pd.DataFrame:
@@ -432,24 +435,24 @@ def fetch_historical_trades(symbol: str, limit: int=HISTORICAL_LIMIT) -> pd.Data
         logger.error(f"Error fetching historical trades: {e}")
         return pd.DataFrame()
 
-def initialize_historical_data():
+def initialize_historical_data(symbol: str):
     """
-    Initialise le DataFrame de trades avec des données historiques.
+    Initialise le DataFrame de trades avec des données historiques des deux dernières heures.
     """
-    historical_df = fetch_historical_trades(DEFAULT_SYMBOL)
+    historical_df = fetch_historical_trades(symbol)
     if not historical_df.empty and not historical_df.isna().all().all():
         global trades_dict
         with trades_lock:
             trades_dict = pd.concat([trades_dict, historical_df], ignore_index=True)
             # Limiter à 2 heures de données
-            cutoff = int(time.time() * 1000) - (2 * 3600 * 1000)
+            cutoff = int(time.time() * 1000) - INITIAL_DATA_RETENTION_MS
             trades_dict = trades_dict[trades_dict["ts"] > cutoff]
         logger.info(f"Initialized trades_dict with {len(trades_dict)} trades from historical data.")
     else:
         logger.warning("No valid historical data fetched. Starting with empty trades_dict.")
 
 # ============================================================
-#    3) Application Dash (Graphique principal, config store, etc.)
+#    Application Dash (Graphique principal, config store, etc.)
 # ============================================================
 
 # Ajout de la police "Orbitron" de Google Fonts pour un style futuriste
@@ -465,7 +468,125 @@ app.title = "EXOLITE"
 def generate_uuid() -> str:
     return str(uuid.uuid4())
 
-# Mise en page de l'application
+# Mise en page de l'application avec Responsive Design
+def create_control_bar():
+    """Crée une barre de contrôle compacte et simplifiée."""
+    return dbc.Card([
+        dbc.CardBody([
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("TF (s)", className="mb-0"),
+                    dcc.Dropdown(
+                        id="main-timeframe-dropdown",
+                        options=[
+                            {"label": "15s", "value": 15},
+                            {"label": "30s", "value": 30},
+                            {"label": "1m", "value": 60},
+                            {"label": "2m", "value": 120},
+                            {"label": "5m", "value": 300},
+                            {"label": "15m", "value": 900},
+                            {"label": "30m", "value": 1800},
+                            {"label": "1h", "value": 3600},
+                            {"label": "2h", "value": 7200},
+                            {"label": "4h", "value": 14400}
+                        ],
+                        value=60,
+                        clearable=False,
+                        style={
+                            'color': '#000000',
+                            'backgroundColor': '#ffffff',
+                            'fontSize': '12px'
+                        }
+                    )
+                ], width=2, className="mb-2"),
+
+                dbc.Col([
+                    dbc.Label("Bin", className="mb-0"),
+                    dcc.Dropdown(
+                        id="bin-dropdown",
+                        options=[
+                            {"label": "0.5", "value": 0.5},
+                            {"label": "1", "value": 1},
+                            {"label": "5", "value": 5},
+                            {"label": "10", "value": 10},
+                            {"label": "20", "value": 20},
+                            {"label": "50", "value": 50}
+                        ],
+                        value=5,
+                        clearable=False,
+                        style={
+                            'color': '#000000',
+                            'backgroundColor': '#ffffff',
+                            'fontSize': '12px'
+                        }
+                    )
+                ], width=2, className="mb-2"),
+
+                dbc.Col([
+                    dbc.Label("Cluster", className="mb-0"),
+                    dcc.Dropdown(
+                        id="cluster-dropdown",
+                        options=[
+                            {"label": "Buy Vol", "value": "buy_vol"},
+                            {"label": "Sell Vol", "value": "sell_vol"},
+                            {"label": "Count Trades", "value": "count_trades"},
+                            {"label": "Delta Vol", "value": "delta_vol"}  # Nouveau cluster
+                        ],
+                        value="buy_vol",
+                        clearable=False,
+                        style={
+                            'color': '#000000',
+                            'backgroundColor': '#ffffff',
+                            'fontSize': '12px'
+                        }
+                    )
+                ], width=3, className="mb-2"),
+
+                dbc.Col([
+                    dbc.Label("Min Vol (BTC)", className="mb-0"),
+                    dcc.Dropdown(
+                        id="min-vol-dropdown",
+                        options=[
+                            {"label": "0.0", "value": 0.0},
+                            {"label": "1.0", "value": 1.0},
+                            {"label": "2.0", "value": 2.0},
+                            {"label": "5.0", "value": 5.0},
+                            {"label": "10.0", "value": 10.0},
+                            {"label": "20.0", "value": 20.0},
+                            {"label": "50.0", "value": 50.0}
+                        ],
+                        value=0.0,
+                        clearable=False,
+                        style={
+                            'color': '#000000',
+                            'backgroundColor': '#ffffff',
+                            'fontSize': '12px'
+                        }
+                    )
+                ], width=3, className="mb-2"),
+
+                dbc.Col([
+                    dbc.Label("Options", className="mb-0"),
+                    dbc.Checklist(
+                        options=[
+                            {"label": "POC", "value": "show_poc"},
+                            {"label": "VAL", "value": "show_val"},
+                            {"label": "VAH", "value": "show_vah"},
+                            {"label": "Volume Profile", "value": "show_vp"},
+                            {"label": "Heatmap", "value": "show_heatmap"},
+                            {"label": "Delta Text", "value": "show_delta"}
+                        ],
+                        value=["show_poc", "show_val", "show_vah", "show_vp", "show_heatmap", "show_delta"],  # Sélection par défaut
+                        id="options-checklist",
+                        inline=True,
+                        switch=True,  # Utilisation de switches pour plus de compacité
+                        style={"fontSize": "10px"}
+                    )
+                ], width=3, className="mb-2"),
+            ], align="center", className="gx-2")  # Réduction de l'espace entre les colonnes
+        ])
+    ], className="mb-3")
+
 app.layout = dbc.Container(
     fluid=True,
     style={
@@ -481,22 +602,23 @@ app.layout = dbc.Container(
             dbc.Col([
                 html.H1(
                     "EXOLITE",
-                    className="text-center mb-3",  # Centré horizontalement
+                    className="text-center mb-2",  # Réduit la marge inférieure
                     style={
-                        'font-family': '"Orbitron", sans-serif',  # Police futuriste
-                        'font-weight': '700'  # Utilisation de la graisse de police disponible
+                        'font-family': '"Orbitron", sans-serif',
+                        'font-weight': '700',
+                        'font-size': '2rem'  # Taille de police réduite
                     }
                 )
             ], width=12)
-        ]),
+        ], justify="center"),
 
-        # Panneau de contrôle en barre horizontale compacte
+        # Barre de contrôle compacte en une seule ligne
         dbc.Card([
             dbc.CardBody([
                 dbc.Row([
                     # Timeframe Dropdown
                     dbc.Col([
-                        dbc.Label("TF (s):", html_for="main-timeframe-dropdown", className="mb-0"),
+                        dbc.Label("TF:", html_for="main-timeframe-dropdown", className="mb-0", style={"font-size": "0.8rem"}),
                         dcc.Dropdown(
                             id="main-timeframe-dropdown",
                             options=[
@@ -506,24 +628,25 @@ app.layout = dbc.Container(
                                 {"label": "2m", "value": 120},
                                 {"label": "5m", "value": 300},
                                 {"label": "15m", "value": 900},
-                                {"label": "30m", "value": 1800},  # Nouvelle option
-                                {"label": "1h", "value": 3600},   # Nouvelle option
-                                {"label": "2h", "value": 7200},   # Nouvelle option
-                                {"label": "4h", "value": 14400}   # Nouvelle option
+                                {"label": "30m", "value": 1800},
+                                {"label": "1h", "value": 3600},
+                                {"label": "2h", "value": 7200},
+                                {"label": "4h", "value": 14400}
                             ],
                             value=60,
                             clearable=False,
                             style={
                                 'color': '#000000',
                                 'backgroundColor': '#ffffff',
-                                'width': '80px'
+                                'width': '80px',
+                                'fontSize': '12px'
                             }
                         )
-                    ], width="auto", className="mx-1"),
+                    ], width="auto", className="d-flex align-items-center me-2"),
 
                     # Price Bin Dropdown
                     dbc.Col([
-                        dbc.Label("Bin:", html_for="bin-dropdown", className="mb-0"),
+                        dbc.Label("Bin:", html_for="bin-dropdown", className="mb-0", style={"font-size": "0.8rem"}),
                         dcc.Dropdown(
                             id="bin-dropdown",
                             options=[
@@ -539,35 +662,37 @@ app.layout = dbc.Container(
                             style={
                                 'color': '#000000',
                                 'backgroundColor': '#ffffff',
-                                'width': '100px'
+                                'width': '80px',
+                                'fontSize': '12px'
                             }
                         )
-                    ], width="auto", className="mx-1"),
+                    ], width="auto", className="d-flex align-items-center me-2"),
 
                     # Cluster Type Dropdown
                     dbc.Col([
-                        dbc.Label("Cluster:", html_for="cluster-dropdown", className="mb-0"),
+                        dbc.Label("Cluster:", html_for="cluster-dropdown", className="mb-0", style={"font-size": "0.8rem"}),
                         dcc.Dropdown(
                             id="cluster-dropdown",
                             options=[
                                 {"label":"Buy Vol","value":"buy_vol"},
                                 {"label":"Sell Vol","value":"sell_vol"},
                                 {"label":"Count Trades","value":"count_trades"},
-                                {"label":"Net Vol","value":"net_vol"}  # Nouveau type de cluster
+                                {"label":"Delta Vol","value":"delta_vol"}
                             ],
                             value="buy_vol",
                             clearable=False,
                             style={
                                 'color': '#000000',
                                 'backgroundColor': '#ffffff',
-                                'width': '150px'
+                                'width': '100px',
+                                'fontSize': '12px'
                             }
                         )
-                    ], width="auto", className="mx-1"),
+                    ], width="auto", className="d-flex align-items-center me-2"),
 
                     # Min Volume Dropdown
                     dbc.Col([
-                        dbc.Label("Min Vol (BTC):", html_for="min-vol-dropdown", className="mb-0"),
+                        dbc.Label("Min Vol:", html_for="min-vol-dropdown", className="mb-0", style={"font-size": "0.8rem"}),
                         dcc.Dropdown(
                             id="min-vol-dropdown",
                             options=[
@@ -576,30 +701,45 @@ app.layout = dbc.Container(
                                 {"label": "2.0", "value": 2.0},
                                 {"label": "5.0", "value": 5.0},
                                 {"label": "10.0", "value": 10.0},
-                                {"label": "20.0", "value": 20.0},  # Nouvelle option
-                                {"label": "50.0", "value": 50.0}   # Nouvelle option
+                                {"label": "20.0", "value": 20.0},
+                                {"label": "50.0", "value": 50.0}
                             ],
                             value=0.0,
                             clearable=False,
                             style={
                                 'color': '#000000',
                                 'backgroundColor': '#ffffff',
-                                'width': '100px'
+                                'width': '100px',
+                                'fontSize': '12px'
                             }
                         )
-                    ], width="auto", className="mx-1"),
+                    ], width="auto", className="d-flex align-items-center me-2"),
 
-                    # Show Text Checklist
+                    # Checkboxes regroupés avec tooltip pour labels
                     dbc.Col([
-                        dbc.Label("Show Text:", html_for="show-text-checklist", className="mb-0"),
+                        dbc.Label("Options:", className="mb-0", style={"font-size": "0.8rem"}),
+                        dbc.Tooltip(
+                            "Afficher les options de graphique",
+                            target="options-checklist"
+                        ),
                         dbc.Checklist(
-                            options=[{"label": "", "value": "show_text"}],
-                            value=[],  # Désactivé par défaut
-                            id="show-text-checklist",
-                            switch=True
+                            options=[
+                                {"label": "POC", "value": "show_poc"},
+                                {"label": "VAL", "value": "show_val"},
+                                {"label": "VAH", "value": "show_vah"},
+                                {"label": "VP", "value": "show_vp"},  # Volume Profile
+                                {"label": "Heat", "value": "show_heatmap"},  # Heatmap
+                                {"label": "Δ Text", "value": "show_delta"}  # Delta Text
+                            ],
+                            value=["show_poc", "show_val", "show_vah", "show_vp", "show_heatmap", "show_delta"],
+                            id="options-checklist",
+                            inline=True,
+                            switch=True,
+                            style={"font-size": "0.8rem"}
                         )
-                    ], width="auto", className="mx-1"),
-                ], align="center", className="gx-2")
+                    ], width="auto", className="d-flex align-items-center")
+                    
+                ], align="center", className="gx-1")  # Réduction de l'espace entre les colonnes
             ])
         ], className="mb-3"),
 
@@ -613,58 +753,64 @@ app.layout = dbc.Container(
                         dcc.Graph(id="main-graph", config={
                             "displayModeBar": True,
                             "modeBarButtonsToAdd": ['zoom2d', 'pan2d', 'select2d', 'lasso2d', 'resetScale2d'],
-                            "scrollZoom": True  # Permet le zoom via la molette
+                            "scrollZoom": True
                         })
                     ])
                 ], className="mb-4"),
 
-            ], width=12)  # Graphique principal occupant toute la largeur
+            ], width=12)
         ], className="mb-4"),
 
         # Interval pour rafraîchissement des données
         dcc.Interval(id="interval-refresh", interval=REFRESH_INTERVAL_MS, n_intervals=0),
+
     ]
 )
 
 # ============================================================
-#           4) Callbacks Optimisés et Enrichis
+#           Callbacks Optimisés et Enrichis
 # ============================================================
 
 # Callback pour mettre à jour le graphique principal
 @app.callback(
     Output("main-graph", "figure"),
     [
-        Input("interval-refresh", "n_intervals")
-    ],
-    [
-        State("main-timeframe-dropdown", "value"),
-        State("bin-dropdown", "value"),
-        State("min-vol-dropdown", "value"),
-        State("cluster-dropdown", "value"),
-        State("show-text-checklist", "value")  # Nouvel état ajouté
+        Input("interval-refresh", "n_intervals"),
+        Input("main-timeframe-dropdown", "value"),
+        Input("bin-dropdown", "value"),
+        Input("min-vol-dropdown", "value"),
+        Input("cluster-dropdown", "value"),
+        Input("options-checklist", "value"),
     ]
 )
-def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
+def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, options):
     """
     Génère le contenu du graphique principal basé sur les paramètres sélectionnés.
     """
-    logger.debug("Rendering main graph...")
-    only_big = False  # Big Trades a été supprimé
-    ohlc_df = build_ohlc_df(DEFAULT_SYMBOL, timeframe_s, only_big_trades=only_big, min_volume_filter=min_vol)
+    logger.info("Rendering main graph...")
+    symbol = DEFAULT_SYMBOL.upper()
+    ohlc_df = build_ohlc_df(symbol, timeframe_s, only_big_trades=False, min_volume_filter=min_vol)
+    
+    # Choisir la fonction d'agrégation en fonction du cluster_type
     fp_df, colorscale, colorbar_title = build_footprint_df(
-        DEFAULT_SYMBOL, timeframe_s, bin_s, cluster_type=cluster_type, 
-        only_big_trades=only_big, min_volume_filter=min_vol
+        symbol, timeframe_s, bin_s, cluster_type=cluster_type, 
+        only_big_trades=False, min_volume_filter=min_vol
     )
-    vp_df = build_volume_profile_df(DEFAULT_SYMBOL, timeframe_s, bin_s, only_big_trades=only_big, min_volume_filter=min_vol)
+    
+    vp_df = build_volume_profile_df(symbol, timeframe_s, bin_s, only_big_trades=False, min_volume_filter=min_vol)
 
     # Calcul des POC, VAL, VAH
     poc_val_vah_df = calculate_poc_val_vah(vp_df)
 
-    # Log les totaux buy_vol et sell_vol
+    # Log les totaux buy_vol, sell_vol ou delta_vol
     if not fp_df.empty:
-        total_buy = fp_df["buy_vol"].sum()
-        total_sell = fp_df["sell_vol"].sum()
-        logger.debug(f"Total Buy Volume: {total_buy}, Total Sell Volume: {total_sell}")
+        if cluster_type == "delta_vol":
+            total_delta = fp_df["value"].sum()
+            logger.debug(f"Total Delta Volume: {total_delta}")
+        else:
+            total_buy = fp_df["buy_vol"].sum()
+            total_sell = fp_df["sell_vol"].sum()
+            logger.debug(f"Total Buy Volume: {total_buy}, Total Sell Volume: {total_sell}")
     else:
         logger.debug("Footprint DataFrame is empty.")
 
@@ -680,10 +826,11 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
         uirevision="constant",
         height=700,  # Réduit la hauteur pour maximiser l'espace
         template="plotly_dark",
-        margin=dict(l=50, r=50, t=30, b=50),  # Réduit la marge du haut
-        hovermode="x unified",
+        margin=dict(l=25, r=30, t=20, b=20),  # Réduit la marge du haut
+        hovermode="closest",  # Désactiver l'affichage des données au survol
         showlegend=False,
-        dragmode='pan'  # Permet le déplacement via clic gauche et glisser
+        dragmode='pan',  # Permet le déplacement via clic gauche et glisser
+        xaxis_rangeslider_visible=False,
     )
 
     # --- Candlestick
@@ -696,7 +843,8 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
                 low=ohlc_df["low"],
                 close=ohlc_df["close"],
                 name="Candles",
-                showlegend=False
+                showlegend=False,
+                hoverinfo='skip'  # Désactiver les info-bulles sur les candlesticks
             ),
             row=1, col=1
         )
@@ -705,7 +853,7 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
         logger.debug("Main Graph: OHLC DataFrame is empty.")
 
     # --- Footprint Heatmap
-    if not fp_df.empty:
+    if "show_heatmap" in options and not fp_df.empty:
         pivot_fp = fp_df.pivot(index="price_bin", columns="datetime", values="value")
         if pivot_fp is not None and not pivot_fp.empty:
             pivot_fp = pivot_fp.sort_index(ascending=False)
@@ -713,8 +861,23 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
             y_vals = list(pivot_fp.index)
             z_vals = pivot_fp.fillna(0).values
 
-            # Remplacer les z_vals où le cluster est 0 par None pour ne pas colorer
-            z_vals = np.where(pivot_fp.values == 0, None, pivot_fp.values)
+            # Normalisation des valeurs pour l'échelle de couleurs centrée sur 0 si delta_vol
+            if cluster_type == "delta_vol":
+                max_abs = np.nanmax(np.abs(z_vals))
+                if max_abs != 0:
+                    z_vals = z_vals / max_abs
+                else:
+                    z_vals = z_vals
+                z_mid = 0  # Centre de l'échelle de couleurs
+            else:
+                max_val = np.nanmax(z_vals)
+                min_val = np.nanmin(z_vals)
+                if cluster_type in ["buy_vol", "sell_vol"]:
+                    if max_val != 0:
+                        z_vals = z_vals / max_val
+                    else:
+                        z_vals = z_vals
+                z_mid = None  # Pas de centre spécifique
 
             # Définir l'échelle de couleurs personnalisée si nécessaire
             heatmap_colorscale = colorscale
@@ -727,12 +890,13 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
                 "colorscale": heatmap_colorscale,
                 "colorbar": dict(
                     title=colorbar_title,  # Titre de la légende
-                    x=-0.15,               # Place la légende à gauche du graphique
-                    thickness=60            # Ajuste la largeur de la barre
+                    x=-0.05,               # Place la légende à gauche du graphique
+                    thickness=30           # Ajuste la largeur de la barre
                 ),
-                "opacity": 0.3,  # Ajuster l'opacité pour mieux voir les carrés rouges
+                "opacity": 0.5,  # Ajuster l'opacité pour mieux voir les éléments sous-jacents
                 "showscale": True,  # Afficher la légende
-                "hovertemplate": "Time: %{x}<br>Price Bin: %{y}<br>Value: %{z}<extra></extra>"
+                "hovertemplate": "Time: %{x}<br>Price Bin: %{y}<br>Value: %{z:.2f}<extra></extra>",
+                "zmid": z_mid  # Centrer l'échelle sur 0 si delta_vol
             }
 
             # Ajout de la Heatmap
@@ -744,10 +908,10 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
         else:
             logger.debug("Main Graph: Footprint pivot table is empty.")
     else:
-        logger.debug("Main Graph: Footprint DataFrame is empty.")
+        logger.debug("Main Graph: Heatmap is hidden or Footprint DataFrame is empty.")
 
     # --- Volume Profile intégré en tant que Scatter
-    if not vp_df.empty and not ohlc_df.empty:
+    if "show_vp" in options and not vp_df.empty and not ohlc_df.empty:
         # Calculer le volume total par price_bin pour ajuster la taille
         volume_total = vp_df.groupby("price_bin")["volume"].sum().reset_index()
         vp_df = vp_df.merge(volume_total, on="price_bin", suffixes=('', '_total'))
@@ -759,17 +923,19 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
                 marker=dict(
                     size=np.log1p(vp_df["volume_total"]) * 5,  # Taille proportionnelle au volume
                     color='orange',
-                    opacity=0.1  # Réduit l'opacité à 0.1
+                    opacity=0.2  # Réduit l'opacité à 0.2
                 ),
                 name="Volume Profile",
-                showlegend=False
+                showlegend=False,
+                hoverinfo='skip'  # Désactiver les info-bulles sur le Volume Profile
             ),
             row=1, col=1
         )
         logger.debug("Main Graph: Added Volume Profile Scatter.")
 
-        # --- POC, VAL, VAH Cercles
-        if not poc_val_vah_df.empty:
+    # --- POC, VAL, VAH Cercles (Indépendants du Volume Profile)
+    if not poc_val_vah_df.empty:
+        if "show_poc" in options:
             # POC en rouge
             fig.add_trace(
                 go.Scatter(
@@ -784,10 +950,11 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
                     ),
                     name="POC",
                     showlegend=False,
-                    hovertemplate='POC: %{y}<extra></extra>'
+                    hoverinfo='skip'  # Désactiver les info-bulles
                 ),
                 row=1, col=1
             )
+        if "show_val" in options:
             # VAL en jaune
             fig.add_trace(
                 go.Scatter(
@@ -802,10 +969,11 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
                     ),
                     name="VAL",
                     showlegend=False,
-                    hovertemplate='VAL: %{y}<extra></extra>'
+                    hoverinfo='skip'  # Désactiver les info-bulles
                 ),
                 row=1, col=1
             )
+        if "show_vah" in options:
             # VAH en jaune
             fig.add_trace(
                 go.Scatter(
@@ -820,100 +988,39 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
                     ),
                     name="VAH",
                     showlegend=False,
-                    hovertemplate='VAH: %{y}<extra></extra>'
+                    hoverinfo='skip'  # Désactiver les info-bulles
                 ),
                 row=1, col=1
             )
-            logger.debug("Main Graph: Added POC, VAL, VAH markers.")
+        logger.debug("Main Graph: Added POC, VAL, VAH markers.")
     else:
-        logger.debug("Main Graph: Volume Profile DataFrame is empty or OHLC DataFrame is empty.")
+        logger.debug("Main Graph: POC, VAL, VAH DataFrame is empty.")
 
-    # --- Delta et Comptes Longs/Courts Texte (annotations centrées à l'intérieur des bougies)
-    if not ohlc_df.empty:
+    # --- Delta Texte (annotations centrées à l'intérieur des bougies)
+    if "show_delta" in options and not ohlc_df.empty:
         # Calculer les deltas en vectorisé
         ohlc_df["delta"] = ohlc_df['close'] - ohlc_df['open']
         annotations = []
         for _, row in ohlc_df.iterrows():
             # Positionnement exact au centre de la bougie
-            y_position = (row["open"] + row["close"]) / 2
+            y_position = (row["open"] + row["close"]) / 2  # Recentrage exact
             annotations.append(dict(
                 x=row["datetime"],
                 y=y_position,
-                text=f"Δ {row['delta']:.2f}<br>L: {row['longs']} S: {row['shorts']}",
+                text=f"Δ {row['delta']:.2f}",
                 showarrow=False,
                 xanchor='center',  # Centrer horizontalement
                 yanchor='middle',  # Centrer verticalement
                 font=dict(color="white", size=10),  # Taille de police adaptée
                 align="center"
             ))
-        fig.update_layout(annotations=annotations)
-        logger.debug("Main Graph: Added Delta and Long/Short annotations.")
-
-    # --- Footprint Texte (Acheteur / Vendeur)
-    if "show_text" in show_text and not fp_df.empty:
-        # Filtrer les données pour éviter la surcharge
-        text_df = fp_df.copy()
-        text_df = text_df[(text_df["buy_vol"] > 0) | (text_df["sell_vol"] > 0)]
-
-        # Préparer les textes pour les acheteurs et les vendeurs
-        buy_text_df = text_df[text_df["buy_vol"] > 0].copy()
-        sell_text_df = text_df[text_df["sell_vol"] > 0].copy()
-
-        # Positionner les textes des acheteurs à gauche de la bougie
-        buy_text_df["x"] = buy_text_df["datetime"] - pd.Timedelta(seconds=timeframe_s / 2)
-        buy_text_df["y"] = buy_text_df["price_bin"]
-
-        # Positionner les textes des vendeurs à droite de la bougie
-        sell_text_df["x"] = sell_text_df["datetime"] + pd.Timedelta(seconds=timeframe_s / 2)
-        sell_text_df["y"] = sell_text_df["price_bin"]
-
-        # Limiter le nombre de textes affichés pour des performances optimales
-        MAX_TEXTS = 1000
-
-        if len(buy_text_df) > MAX_TEXTS:
-            buy_text_df = buy_text_df.sample(n=MAX_TEXTS//2, random_state=1)
-        if len(sell_text_df) > MAX_TEXTS:
-            sell_text_df = sell_text_df.sample(n=MAX_TEXTS//2, random_state=1)
-
-        # Ajouter une trace Scatter pour les textes des acheteurs
-        if not buy_text_df.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=buy_text_df["x"],
-                    y=buy_text_df["y"],
-                    mode='text',
-                    text=buy_text_df["buy_vol"].apply(lambda x: f"{x:.1f}"),
-                    textposition='middle right',
-                    textfont=dict(
-                        size=10,
-                        color='green'  # Acheteurs en vert
-                    ),
-                    showlegend=False,
-                    hoverinfo='none'  # Désactiver les info-bulles pour le texte
-                ),
-                row=1, col=1
-            )
-            logger.debug("Main Graph: Added Buy Footprint Text annotations.")
-
-        # Ajouter une trace Scatter pour les textes des vendeurs
-        if not sell_text_df.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=sell_text_df["x"],
-                    y=sell_text_df["y"],
-                    mode='text',
-                    text=sell_text_df["sell_vol"].apply(lambda x: f"{x:.1f}"),
-                    textposition='middle left',
-                    textfont=dict(
-                        size=10,
-                        color='red'  # Vendeurs en rouge
-                    ),
-                    showlegend=False,
-                    hoverinfo='none'  # Désactiver les info-bulles pour le texte
-                ),
-                row=1, col=1
-            )
-            logger.debug("Main Graph: Added Sell Footprint Text annotations.")
+        # Récupérer les annotations existantes et les convertir en liste
+        existing_annotations = list(fig.layout.annotations) if fig.layout.annotations else []
+        # Ajouter les nouvelles annotations aux existantes
+        fig.update_layout(annotations=existing_annotations + annotations)
+        logger.debug("Main Graph: Added Delta annotations.")
+    else:
+        logger.debug("Main Graph: Delta text is hidden or OHLC DataFrame is empty.")
 
     # Mise à jour des axes
     fig.update_xaxes(title_text=None, row=1, col=1)
@@ -931,9 +1038,6 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
     fig.update_xaxes(showgrid=False)  # Désactiver la grille horizontale
     fig.update_yaxes(showgrid=False)  # Désactiver la grille verticale
 
-    # Supprimer le range slider de l'axe des X
-    fig.update_layout(xaxis_rangeslider_visible=False)
-
     # Vérifier si la figure contient des données
     if not fig.data:
         logger.warning("Main Graph: Figure contains no data.")
@@ -942,21 +1046,6 @@ def render_main_graph(n, timeframe_s, bin_s, min_vol, cluster_type, show_text):
 
     return fig
 
-# Callback pour traiter les buffers de trades régulièrement
-def periodic_trade_processor():
-    """
-    Processus en arrière-plan pour traiter les buffers de trades et les ajouter au DataFrame principal.
-    """
-    logger.info("Started trade processor thread.")
-    while not shutdown_event.is_set():
-        process_trades_buffer()
-        time.sleep(1)  # Traiter les buffers toutes les secondes
-    logger.info("Stopped trade processor thread.")
-
-# Lancer le processeur de trades dans un thread séparé
-trade_processor_thread = threading.Thread(target=periodic_trade_processor, daemon=True)
-trade_processor_thread.start()
-
 # ============================================================
 #                       MAIN
 # ============================================================
@@ -964,30 +1053,37 @@ trade_processor_thread.start()
 def signal_handler(sig, frame):
     """Gestionnaire de signal pour une fermeture propre."""
     logger.info("Received shutdown signal.")
-    stop_websockets()
+    ws_manager.stop_websockets()
     shutdown_event.set()
     sys.exit(0)
-
-# Enregistrer le gestionnaire de signal pour une fermeture propre
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
 
 if __name__ == "__main__":
     try:
         # Initialiser les données historiques avant de démarrer les WebSockets
-        initialize_historical_data()
+        initialize_historical_data(DEFAULT_SYMBOL)
+
+        # Créer une instance de WebSocketManager
+        ws_manager = WebSocketManager(DEFAULT_SYMBOL)
 
         # Démarrer les WebSockets pour le symbole par défaut
-        start_trade_ws_thread()
-        start_depth_ws_thread()
+        ws_manager.start_trade_ws()
+        ws_manager.start_depth_ws()
 
-        # Lancer le serveur Dash en mode débogage pour plus d'informations
+        # Lancer le processeur de trades dans un thread séparé
+        trade_processor_thread = threading.Thread(target=periodic_trade_processor, daemon=True)
+        trade_processor_thread.start()
+
+        # Enregistrer le gestionnaire de signal pour une fermeture propre
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        # Lancer le serveur Dash en mode débogage désactivé
         logger.info("Starting Dash server.")
         app.run_server(debug=False, host="0.0.0.0", port=8050)
     except Exception as e:
         logger.error(f"Error in main execution: {e}")
     finally:
-        stop_websockets()
+        ws_manager.stop_websockets()
         shutdown_event.set()
         trade_processor_thread.join(timeout=5)
         logger.info("Application has been shut down.")
